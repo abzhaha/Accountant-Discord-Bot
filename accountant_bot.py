@@ -278,10 +278,18 @@ async def enforce_top_role(guild: discord.Guild, standings=None):
     if standings is None:
         standings = get_standings()
     role_id = get_config(guild.id, "top_role")
-    if not role_id or not standings:
+    if not role_id:
         return
     role = guild.get_role(int(role_id))
     if not role:
+        return
+    if not standings:
+        # nobody has entries — nobody should have the role
+        for member in role.members:
+            try:
+                await member.remove_roles(role, reason="Leaderboard is empty")
+            except discord.Forbidden:
+                pass
         return
     top_uid = standings[0][0]
     for member in role.members:
@@ -448,6 +456,8 @@ async def undo(interaction: discord.Interaction):
         f"Removed `{sign}${row[1]:,.2f}`" + (f" ({row[2]})" if row[2] else ""),
         ephemeral=True,
     )
+    await enforce_top_role(interaction.guild)
+    await update_live_leaderboard(interaction.guild)
 
 # ── /reset ──────────────────────────────────────────────────────────────────────
 @bot.tree.command(name="reset", description="Reset your PNL to zero (deletes all your entries)")
@@ -460,6 +470,8 @@ async def reset(interaction: discord.Interaction):
     await interaction.response.send_message(
         f"Cleared **{deleted}** entries. Starting fresh!", ephemeral=True
     )
+    await enforce_top_role(interaction.guild)
+    await update_live_leaderboard(interaction.guild)
 
 # ── Admin setup commands ────────────────────────────────────────────────────────
 @bot.tree.command(name="setleaderboardchannel", description="[Admin] Set channel for hourly leaderboard posts")
