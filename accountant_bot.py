@@ -29,7 +29,11 @@ from discord.ext import commands, tasks
 import sqlite3
 import os
 import io
+import aiohttp
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+
+UK_TZ = ZoneInfo("Europe/London")
 
 import matplotlib
 matplotlib.use("Agg")
@@ -121,7 +125,69 @@ async def on_ready():
         print(f"Sync error: {e}")
     if not hourly_leaderboard.is_running():
         hourly_leaderboard.start()
+    if not prayer_ping_loop.is_running():
+        prayer_ping_loop.start()
     print(f"Accountant is online as {bot.user}")
+
+# ── Prayer times (Watford, UK) ─────────────────────────────────────────────────
+PRAYER_NAMES = ["Fajr", "Dhuhr", "Asr", "Maghrib", "Isha"]
+_prayer_cache = {}   # date -> {prayer: "HH:MM"}
+_pinged = set()      # (guild_id, date, prayer) already announced
+
+async def fetch_prayer_times(day):
+    """Fetch prayer times for Watford for the given date (cached)."""
+    if day in _prayer_cache:
+        return _prayer_cache[day]
+    url = (
+        "https://api.aladhan.com/v1/timingsByCity/"
+        f"{day.strftime('%d-%m-%Y')}"
+        "?city=Watford&country=GB&method=15&school=1"
+    )
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                data = await resp.json()
+        timings = data["data"]["timings"]
+        result = {p: timings[p][:5] for p in PRAYER_NAMES}
+        _prayer_cache.clear()  # keep only today
+        _prayer_cache[day] = result
+        return result
+    except Exception as e:
+        print(f"Prayer time fetch failed: {e}")
+        return None
+
+@tasks.loop(minutes=1)
+async def prayer_ping_loop():
+    now = datetime.now(UK_TZ)
+    today = now.date()
+    times = await fetch_prayer_times(today)
+    if not times:
+        return
+    current = now.strftime("%H:%M")
+    for guild in bot.guilds:
+        channel_id = get_config(guild.id, "prayer_channel")
+        if not channel_id:
+            continue
+        channel = guild.get_channel(int(channel_id))
+        if not channel:
+            continue
+        for prayer, t in times.items():
+            if t != current or (guild.id, today, prayer) in _pinged:
+                continue
+            _pinged.add((guild.id, today, prayer))
+            if prayer == "Dhuhr" and now.weekday() == 4:  # Friday
+                msg = (f"@everyone 🕌 It's time for **Jummah**! "
+                       f"Watford Central Mosque: 1:30 PM & 2:30 PM • North Watford: 1:30 PM")
+            else:
+                msg = f"@everyone 🕌 It's time for **{prayer}** ({t})"
+            try:
+                await channel.send(msg)
+            except discord.Forbidden:
+                pass
+
+@prayer_ping_loop.before_loop
+async def before_prayer_loop():
+    await bot.wait_until_ready()
 
 # ── Leaderboard embed builder ──────────────────────────────────────────────────
 def build_leaderboard_embed(guild: discord.Guild, rows, title="🏆 All-Time Leaderboard"):
@@ -579,6 +645,34 @@ async def setalertchannel(interaction: discord.Interaction, channel: discord.Tex
     await interaction.response.send_message(
         f"Overtake alerts will be sent in {channel.mention}", ephemeral=True
     )
+
+@bot.tree.command(name="setprayerchannel", description="[Admin] Set channel for prayer time pings (Watford times)")
+@app_commands.describe(channel="Channel for prayer announcements")
+@app_commands.default_permissions(administrator=True)
+async def setprayerchannel(interaction: discord.Interaction, channel: discord.TextChannel):
+    set_config(interaction.guild.id, "prayer_channel", str(channel.id))
+    await interaction.response.send_message(
+        f"Prayer time pings will be sent in {channel.mention}", ephemeral=True
+    )
+
+@bot.tree.command(name="prayertimes", description="Today's prayer times for Watford")
+async def prayertimes(interaction: discord.Interaction):
+    await interaction.response.defer()
+    times = await fetch_prayer_times(datetime.now(UK_TZ).date())
+    if not times:
+        await interaction.followup.send("Couldn't fetch prayer times right now, try again later.")
+        return
+    embed = discord.Embed(title="🕌 Prayer Times — Watford", color=discord.Color.teal())
+    for prayer, t in times.items():
+        embed.add_field(name=prayer, value=f"`{t}`", inline=True)
+    if datetime.now(UK_TZ).weekday() == 4:
+        embed.add_field(
+            name="Jummah",
+            value="Central: `13:30` & `14:30`\nNorth Watford: `13:30`",
+            inline=True,
+        )
+    embed.set_footer(text="Source: AlAdhan API (Moonsighting, Hanafi Asr)")
+    await interaction.followup.send(embed=embed)
 
 @bot.tree.command(name="settoprole", description="[Admin] Set the role given to #1 on the leaderboard")
 @app_commands.describe(role_id="The role ID (right-click role → Copy ID)")
