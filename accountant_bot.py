@@ -474,6 +474,54 @@ async def graph(interaction: discord.Interaction, user: discord.User = None):
 
     await interaction.followup.send(file=discord.File(buf, filename="pnl_graph.png"))
 
+# ── /stats ──────────────────────────────────────────────────────────────────────
+@bot.tree.command(name="stats", description="Your (or someone else's) PNL stats")
+@app_commands.describe(user="User to check (defaults to you)")
+async def stats(interaction: discord.Interaction, user: discord.User = None):
+    target = user or interaction.user
+    conn = get_db()
+    row = conn.execute(
+        """SELECT COUNT(*), COALESCE(SUM(amount),0), MAX(amount), MIN(amount),
+                  AVG(amount), SUM(CASE WHEN amount > 0 THEN 1 ELSE 0 END)
+           FROM entries WHERE user_id = ?""",
+        (target.id,),
+    ).fetchone()
+    count, total, biggest_win, biggest_loss, avg, wins = row
+
+    if not count:
+        conn.close()
+        await interaction.response.send_message(
+            f"{target.display_name} has no entries yet!", ephemeral=True
+        )
+        return
+
+    # Best day
+    best_day = conn.execute(
+        """SELECT date(created_at), SUM(amount) FROM entries WHERE user_id = ?
+           GROUP BY date(created_at) ORDER BY SUM(amount) DESC LIMIT 1""",
+        (target.id,),
+    ).fetchone()
+
+    # Rank
+    standings = get_standings()
+    rank = next((i + 1 for i, (uid, _) in enumerate(standings) if uid == target.id), None)
+    conn.close()
+
+    win_rate = wins / count * 100
+
+    color = discord.Color.green() if total >= 0 else discord.Color.red()
+    embed = discord.Embed(title=f"📊 {target.display_name}'s Stats", color=color)
+    embed.add_field(name="Total", value=f"`£{total:,.2f}`", inline=True)
+    embed.add_field(name="Rank", value=f"`#{rank}` of {len(standings)}", inline=True)
+    embed.add_field(name="Entries", value=f"`{count}`", inline=True)
+    embed.add_field(name="🚀 Biggest Win", value=f"`+£{biggest_win:,.2f}`" if biggest_win > 0 else "`—`", inline=True)
+    embed.add_field(name="💀 Biggest Loss", value=f"`£{biggest_loss:,.2f}`" if biggest_loss < 0 else "`—`", inline=True)
+    embed.add_field(name="Average Entry", value=f"`£{avg:,.2f}`", inline=True)
+    embed.add_field(name="Win Rate", value=f"`{win_rate:.0f}%` ({wins}W / {count - wins}L)", inline=True)
+    if best_day and best_day[1] is not None:
+        embed.add_field(name="Best Day", value=f"`£{best_day[1]:,.2f}` on {best_day[0]}", inline=True)
+    await interaction.response.send_message(embed=embed)
+
 # ── /undo ───────────────────────────────────────────────────────────────────────
 @bot.tree.command(name="undo", description="Undo your last entry")
 async def undo(interaction: discord.Interaction):
