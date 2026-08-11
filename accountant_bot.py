@@ -35,6 +35,12 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
+from matplotlib.ticker import FuncFormatter
+
+GRAPH_COLORS = [
+    "#5865F2", "#57F287", "#FEE75C", "#EB459E", "#ED4245",
+    "#00B8D4", "#FF8C42", "#B388FF", "#69F0AE", "#FF80AB",
+]
 
 # ── Config ──────────────────────────────────────────────────────────────────────
 TOKEN = os.getenv("DISCORD_TOKEN", "YOUR_TOKEN_HERE")
@@ -126,7 +132,7 @@ def build_leaderboard_embed(guild: discord.Guild, rows, title="🏆 All-Time Lea
         member = guild.get_member(uid) if guild else None
         name = member.display_name if member else f"User {uid}"
         sign = "+" if total >= 0 else ""
-        lines.append(f"{prefix} **{name}** — `{sign}${total:,.2f}`")
+        lines.append(f"{prefix} **{name}** — `{sign}£{total:,.2f}`")
     embed = discord.Embed(
         title=title,
         description="\n".join(lines) if lines else "No entries yet!",
@@ -140,11 +146,9 @@ def build_leaderboard_embed(guild: discord.Guild, rows, title="🏆 All-Time Lea
 def build_pnl_graph(guild: discord.Guild, user_ids):
     """Returns a BytesIO PNG of cumulative PNL lines, or None if no data."""
     conn = get_db()
-    fig, ax = plt.subplots(figsize=(10, 6))
-    fig.patch.set_facecolor("#2b2d31")
-    ax.set_facecolor("#2b2d31")
 
-    plotted = False
+    # Collect each user's entries first
+    all_data = []  # (name, [(time, cumulative), ...], final_total)
     for uid in user_ids:
         rows = conn.execute(
             "SELECT created_at, amount FROM entries WHERE user_id = ? ORDER BY id",
@@ -152,35 +156,69 @@ def build_pnl_graph(guild: discord.Guild, user_ids):
         ).fetchall()
         if not rows:
             continue
-        times, cumulative = [], []
-        running = 0.0
+        points, running = [], 0.0
         for ts, amt in rows:
             running += amt
-            times.append(datetime.strptime(ts, "%Y-%m-%d %H:%M:%S"))
-            cumulative.append(running)
+            points.append((datetime.strptime(ts, "%Y-%m-%d %H:%M:%S"), running))
         member = guild.get_member(uid) if guild else None
         name = member.display_name if member else f"User {uid}"
-        ax.plot(times, cumulative, marker="o", markersize=3, linewidth=2, label=name)
-        plotted = True
+        all_data.append((name, points, running))
     conn.close()
 
-    if not plotted:
-        plt.close(fig)
+    if not all_data:
         return None
 
-    ax.axhline(0, color="#555", linewidth=0.8)
-    ax.set_title("Cumulative PNL Over Time", color="white", fontsize=14)
-    ax.set_ylabel("PNL ($)", color="white")
-    ax.tick_params(colors="white")
-    for spine in ax.spines.values():
-        spine.set_color("#555")
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %d"))
-    ax.legend(facecolor="#2b2d31", labelcolor="white", edgecolor="#555")
-    ax.grid(True, alpha=0.15)
-    fig.autofmt_xdate()
+    # Everyone's line starts at $0 from the same moment, so single entries still draw a line
+    global_start = min(pts[0][0] for _, pts, _ in all_data)
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
 
+    # Biggest earner first (nicer legend order)
+    all_data.sort(key=lambda d: d[2], reverse=True)
+
+    bg = "#1e1f22"
+    fig, ax = plt.subplots(figsize=(11, 6))
+    fig.patch.set_facecolor(bg)
+    ax.set_facecolor(bg)
+
+    for i, (name, points, total) in enumerate(all_data):
+        color = GRAPH_COLORS[i % len(GRAPH_COLORS)]
+        times = [global_start] + [t for t, _ in points] + [now]
+        values = [0] + [v for _, v in points] + [points[-1][1]]
+        ax.plot(times, values, color=color, linewidth=2.5,
+                solid_capstyle="round", drawstyle="steps-post",
+                label=f"{name}  (£{total:,.0f})", zorder=3)
+        ax.fill_between(times, values, 0, step="post", color=color, alpha=0.07, zorder=1)
+        # dot on the latest value
+        ax.plot(now, values[-1], "o", color=color, markersize=7,
+                markeredgecolor=bg, markeredgewidth=1.5, zorder=4)
+
+    ax.axhline(0, color="#4e5058", linewidth=1, zorder=2)
+
+    ax.set_title("PNL Race", color="white", fontsize=16, fontweight="bold", pad=15)
+    ax.yaxis.set_major_formatter(FuncFormatter(lambda x, _: f"£{x:,.0f}"))
+    ax.tick_params(colors="#b5bac1", labelsize=10)
+
+    locator = mdates.AutoDateLocator()
+    ax.xaxis.set_major_locator(locator)
+    ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
+
+    for spine in ["top", "right"]:
+        ax.spines[spine].set_visible(False)
+    for spine in ["left", "bottom"]:
+        ax.spines[spine].set_color("#4e5058")
+
+    ax.grid(True, axis="y", alpha=0.12, linewidth=0.8)
+    ax.grid(False, axis="x")
+
+    legend = ax.legend(
+        loc="upper left", facecolor="#2b2d31", edgecolor="#4e5058",
+        labelcolor="white", fontsize=10, framealpha=0.9,
+    )
+    legend.get_frame().set_linewidth(0.5)
+
+    fig.tight_layout()
     buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=120, bbox_inches="tight", facecolor=fig.get_facecolor())
+    fig.savefig(buf, format="png", dpi=150, bbox_inches="tight", facecolor=bg)
     buf.seek(0)
     plt.close(fig)
     return buf
@@ -323,8 +361,8 @@ async def log_entry(interaction: discord.Interaction, amount: float, note: str, 
     sign = "+" if amount >= 0 else ""
     color = discord.Color.green() if amount >= 0 else discord.Color.red()
     embed = discord.Embed(title=title, color=color)
-    embed.add_field(name="Amount", value=f"`{sign}${amount:,.2f}`", inline=True)
-    embed.add_field(name="New Total", value=f"`${total:,.2f}`", inline=True)
+    embed.add_field(name="Amount", value=f"`{sign}£{amount:,.2f}`", inline=True)
+    embed.add_field(name="New Total", value=f"`£{total:,.2f}`", inline=True)
     if note:
         embed.add_field(name="Note", value=note, inline=False)
     embed.set_footer(text=f"Logged by {interaction.user.display_name}")
@@ -334,13 +372,13 @@ async def log_entry(interaction: discord.Interaction, amount: float, note: str, 
 
 # ── /profit ─────────────────────────────────────────────────────────────────────
 @bot.tree.command(name="profit", description="Log money you made")
-@app_commands.describe(amount="Amount in $ you made", note="Optional note")
+@app_commands.describe(amount="Amount in £ you made", note="Optional note")
 async def profit(interaction: discord.Interaction, amount: float, note: str = None):
     await log_entry(interaction, abs(amount), note, "📒 Profit Logged")
 
 # ── /spend ──────────────────────────────────────────────────────────────────────
 @bot.tree.command(name="spend", description="Log money you spent (subtracted from your total)")
-@app_commands.describe(amount="Amount in $ you spent", note="Optional note (e.g. what you spent it on)")
+@app_commands.describe(amount="Amount in £ you spent", note="Optional note (e.g. what you spent it on)")
 async def spend(interaction: discord.Interaction, amount: float, note: str = None):
     await log_entry(interaction, -abs(amount), note, "💸 Expense Logged")
 
@@ -360,13 +398,13 @@ async def balance(interaction: discord.Interaction, user: discord.User = None):
 
     color = discord.Color.green() if total >= 0 else discord.Color.red()
     embed = discord.Embed(title=f"💰 {target.display_name}'s PNL", color=color)
-    embed.add_field(name="Total", value=f"`${total:,.2f}`", inline=False)
+    embed.add_field(name="Total", value=f"`£{total:,.2f}`", inline=False)
 
     if rows:
         history = []
         for amt, nt in rows:
             sign = "+" if amt >= 0 else ""
-            line = f"`{sign}${amt:,.2f}`"
+            line = f"`{sign}£{amt:,.2f}`"
             if nt:
                 line += f" — {nt}"
             history.append(line)
@@ -453,7 +491,7 @@ async def undo(interaction: discord.Interaction):
     conn.close()
     sign = "+" if row[1] >= 0 else ""
     await interaction.response.send_message(
-        f"Removed `{sign}${row[1]:,.2f}`" + (f" ({row[2]})" if row[2] else ""),
+        f"Removed `{sign}£{row[1]:,.2f}`" + (f" ({row[2]})" if row[2] else ""),
         ephemeral=True,
     )
     await enforce_top_role(interaction.guild)
