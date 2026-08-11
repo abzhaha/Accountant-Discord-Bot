@@ -136,21 +136,97 @@ def build_leaderboard_embed(guild: discord.Guild, rows, title="🏆 All-Time Lea
     embed.timestamp = datetime.now(timezone.utc)
     return embed
 
-# ── Hourly leaderboard poster ──────────────────────────────────────────────────
+# ── Graph builder ──────────────────────────────────────────────────────────────
+def build_pnl_graph(guild: discord.Guild, user_ids):
+    """Returns a BytesIO PNG of cumulative PNL lines, or None if no data."""
+    conn = get_db()
+    fig, ax = plt.subplots(figsize=(10, 6))
+    fig.patch.set_facecolor("#2b2d31")
+    ax.set_facecolor("#2b2d31")
+
+    plotted = False
+    for uid in user_ids:
+        rows = conn.execute(
+            "SELECT created_at, amount FROM entries WHERE user_id = ? ORDER BY id",
+            (uid,),
+        ).fetchall()
+        if not rows:
+            continue
+        times, cumulative = [], []
+        running = 0.0
+        for ts, amt in rows:
+            running += amt
+            times.append(datetime.strptime(ts, "%Y-%m-%d %H:%M:%S"))
+            cumulative.append(running)
+        member = guild.get_member(uid) if guild else None
+        name = member.display_name if member else f"User {uid}"
+        ax.plot(times, cumulative, marker="o", markersize=3, linewidth=2, label=name)
+        plotted = True
+    conn.close()
+
+    if not plotted:
+        plt.close(fig)
+        return None
+
+    ax.axhline(0, color="#555", linewidth=0.8)
+    ax.set_title("Cumulative PNL Over Time", color="white", fontsize=14)
+    ax.set_ylabel("PNL ($)", color="white")
+    ax.tick_params(colors="white")
+    for spine in ax.spines.values():
+        spine.set_color("#555")
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %d"))
+    ax.legend(facecolor="#2b2d31", labelcolor="white", edgecolor="#555")
+    ax.grid(True, alpha=0.15)
+    fig.autofmt_xdate()
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=120, bbox_inches="tight", facecolor=fig.get_facecolor())
+    buf.seek(0)
+    plt.close(fig)
+    return buf
+
+# ── Live leaderboard (one message, always kept up to date) ─────────────────────
+async def update_live_leaderboard(guild: discord.Guild):
+    """Edit (or create) the single live leaderboard message with embed + graph."""
+    if guild is None:
+        return
+    channel_id = get_config(guild.id, "leaderboard_channel")
+    if not channel_id:
+        return
+    channel = guild.get_channel(int(channel_id))
+    if not channel:
+        return
+
+    rows = get_standings()
+    embed = build_leaderboard_embed(guild, rows, "🏆 Live PNL Leaderboard")
+
+    files = []
+    buf = build_pnl_graph(guild, [uid for uid, _ in rows[:10]])
+    if buf:
+        files = [discord.File(buf, filename="leaderboard.png")]
+        embed.set_image(url="attachment://leaderboard.png")
+
+    msg_id = get_config(guild.id, "live_message")
+    try:
+        if msg_id:
+            msg = await channel.fetch_message(int(msg_id))
+            await msg.edit(embed=embed, attachments=files)
+            return
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        pass  # fall through and send a fresh one
+
+    try:
+        msg = await channel.send(embed=embed, files=files)
+        set_config(guild.id, "live_message", str(msg.id))
+    except discord.Forbidden:
+        pass
+
+# ── Hourly refresher (safety net) ──────────────────────────────────────────────
 @tasks.loop(hours=1)
 async def hourly_leaderboard():
     for guild in bot.guilds:
-        channel_id = get_config(guild.id, "leaderboard_channel")
-        if not channel_id:
-            continue
-        channel = guild.get_channel(int(channel_id))
-        if not channel:
-            continue
-        rows = get_standings()
-        try:
-            await channel.send(embed=build_leaderboard_embed(guild, rows, "🏆 Hourly Leaderboard Update"))
-        except discord.Forbidden:
-            pass
+        await update_live_leaderboard(guild)
+        await enforce_top_role(guild)
 
 @hourly_leaderboard.before_loop
 async def before_hourly():
@@ -192,23 +268,34 @@ async def handle_standings_change(guild: discord.Guild, before, after, actor_id:
                     break
 
     # Top role: make sure only current #1 has it
+    await enforce_top_role(guild, after)
+
+    # Keep the live leaderboard fresh
+    await update_live_leaderboard(guild)
+
+async def enforce_top_role(guild: discord.Guild, standings=None):
+    """Give the configured role to #1 and remove it from everyone else."""
+    if standings is None:
+        standings = get_standings()
     role_id = get_config(guild.id, "top_role")
-    if role_id and after:
-        role = guild.get_role(int(role_id))
-        if role:
-            top_uid = after[0][0]
-            for member in role.members:
-                if member.id != top_uid:
-                    try:
-                        await member.remove_roles(role, reason="Lost #1 PNL spot")
-                    except discord.Forbidden:
-                        pass
-            top_member = guild.get_member(top_uid)
-            if top_member and role not in top_member.roles:
-                try:
-                    await top_member.add_roles(role, reason="Reached #1 PNL spot")
-                except discord.Forbidden:
-                    pass
+    if not role_id or not standings:
+        return
+    role = guild.get_role(int(role_id))
+    if not role:
+        return
+    top_uid = standings[0][0]
+    for member in role.members:
+        if member.id != top_uid:
+            try:
+                await member.remove_roles(role, reason="Lost #1 PNL spot")
+            except discord.Forbidden:
+                pass
+    top_member = guild.get_member(top_uid)
+    if top_member and role not in top_member.roles:
+        try:
+            await top_member.add_roles(role, reason="Reached #1 PNL spot")
+        except discord.Forbidden:
+            pass
 
 # ── Entry logging core (shared by /profit and /spend) ──────────────────────────
 async def log_entry(interaction: discord.Interaction, amount: float, note: str, title: str):
@@ -329,60 +416,15 @@ async def leaderboard(interaction: discord.Interaction, period: str = "all"):
 async def graph(interaction: discord.Interaction, user: discord.User = None):
     await interaction.response.defer()
 
-    conn = get_db()
     if user:
         user_ids = [user.id]
     else:
         user_ids = [uid for uid, _ in get_standings()[:10]]
 
-    if not user_ids:
+    buf = build_pnl_graph(interaction.guild, user_ids)
+    if not buf:
         await interaction.followup.send("No data to graph yet!")
         return
-
-    fig, ax = plt.subplots(figsize=(10, 6))
-    fig.patch.set_facecolor("#2b2d31")
-    ax.set_facecolor("#2b2d31")
-
-    plotted = False
-    for uid in user_ids:
-        rows = conn.execute(
-            "SELECT created_at, amount FROM entries WHERE user_id = ? ORDER BY id",
-            (uid,),
-        ).fetchall()
-        if not rows:
-            continue
-        times, cumulative = [], []
-        running = 0.0
-        for ts, amt in rows:
-            running += amt
-            times.append(datetime.strptime(ts, "%Y-%m-%d %H:%M:%S"))
-            cumulative.append(running)
-        member = interaction.guild.get_member(uid) if interaction.guild else None
-        name = member.display_name if member else f"User {uid}"
-        ax.plot(times, cumulative, marker="o", markersize=3, linewidth=2, label=name)
-        plotted = True
-    conn.close()
-
-    if not plotted:
-        await interaction.followup.send("No data to graph yet!")
-        plt.close(fig)
-        return
-
-    ax.axhline(0, color="#555", linewidth=0.8)
-    ax.set_title("Cumulative PNL Over Time", color="white", fontsize=14)
-    ax.set_ylabel("PNL ($)", color="white")
-    ax.tick_params(colors="white")
-    for spine in ax.spines.values():
-        spine.set_color("#555")
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %d"))
-    ax.legend(facecolor="#2b2d31", labelcolor="white", edgecolor="#555")
-    ax.grid(True, alpha=0.15)
-    fig.autofmt_xdate()
-
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=120, bbox_inches="tight", facecolor=fig.get_facecolor())
-    buf.seek(0)
-    plt.close(fig)
 
     await interaction.followup.send(file=discord.File(buf, filename="pnl_graph.png"))
 
@@ -425,9 +467,11 @@ async def reset(interaction: discord.Interaction):
 @app_commands.default_permissions(administrator=True)
 async def setleaderboardchannel(interaction: discord.Interaction, channel: discord.TextChannel):
     set_config(interaction.guild.id, "leaderboard_channel", str(channel.id))
+    set_config(interaction.guild.id, "live_message", "")  # force a fresh message
     await interaction.response.send_message(
-        f"Hourly leaderboard will be posted in {channel.mention}", ephemeral=True
+        f"Live leaderboard will be kept up to date in {channel.mention}", ephemeral=True
     )
+    await update_live_leaderboard(interaction.guild)
 
 @bot.tree.command(name="setalertchannel", description="[Admin] Set channel for overtake pings")
 @app_commands.describe(channel="Channel for overtake alerts")
@@ -450,6 +494,7 @@ async def settoprole(interaction: discord.Interaction, role_id: str):
     await interaction.response.send_message(
         f"#1 on the leaderboard will now get the **{role.name}** role", ephemeral=True
     )
+    await enforce_top_role(interaction.guild)  # apply immediately
 
 # ── Run ─────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
