@@ -176,10 +176,10 @@ async def prayer_ping_loop():
                 continue
             _pinged.add((guild.id, today, prayer))
             if prayer == "Dhuhr" and now.weekday() == 4:  # Friday
-                msg = (f"@everyone 🕌 It's time for **Jummah**! "
+                msg = (f"🕌 It's time for **Jummah**! "
                        f"Watford Central Mosque: 1:30 PM & 2:30 PM • North Watford: 1:30 PM")
             else:
-                msg = f"@everyone 🕌 It's time for **{prayer}** ({t})"
+                msg = f"🕌 It's time for **{prayer}** ({t})"
             try:
                 await channel.send(msg)
             except discord.Forbidden:
@@ -342,34 +342,20 @@ async def handle_standings_change(guild: discord.Guild, before, after, actor_id:
     if guild is None:
         return
 
-    # Overtake pings: the actor moved up past anyone previously above them
-    before_rank = {uid: i for i, (uid, _) in enumerate(before)}
-    after_rank = {uid: i for i, (uid, _) in enumerate(after)}
-
-    overtaken = []
-    if actor_id in before_rank and actor_id in after_rank:
-        if after_rank[actor_id] < before_rank[actor_id]:
-            for uid, _ in before:
-                if uid == actor_id:
-                    continue
-                # previously above actor, now below
-                if before_rank[uid] < before_rank[actor_id] and after_rank.get(uid, 999) > after_rank[actor_id]:
-                    overtaken.append(uid)
-    elif actor_id not in before_rank and actor_id in after_rank:
-        # first ever entry — they overtake everyone now below them
-        overtaken = [uid for uid, _ in after if after_rank[uid] > after_rank[actor_id]]
+    # Overtake ping: only when the #1 spot changes hands
+    old_top = before[0][0] if before else None
+    new_top = after[0][0] if after else None
 
     alert_channel_id = get_config(guild.id, "alert_channel")
-    if overtaken and alert_channel_id:
+    if alert_channel_id and new_top is not None and old_top is not None and new_top != old_top:
         channel = guild.get_channel(int(alert_channel_id))
         if channel:
-            for uid in overtaken:
-                try:
-                    await channel.send(
-                        f"@everyone 🚨 <@{actor_id}> overtakes <@{uid}> on the PNL leaderboard!"
-                    )
-                except discord.Forbidden:
-                    break
+            try:
+                await channel.send(
+                    f"@everyone 👑 <@{new_top}> overtakes <@{old_top}> for **#1** on the PNL leaderboard!"
+                )
+            except discord.Forbidden:
+                pass
 
     # Top role: make sure only current #1 has it
     await enforce_top_role(guild, after)
